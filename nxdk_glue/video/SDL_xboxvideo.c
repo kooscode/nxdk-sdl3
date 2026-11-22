@@ -34,7 +34,13 @@ static bool XBOX_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
         window->h = 720;
     }
 
-    if (!XVideoSetMode(window->w, window->h, bpp, REFRESH_DEFAULT)) {
+    // Keep a mode the application already set itself (e.g. 480i programmed
+    // with AvSetDisplayMode after XVideoSetMode): setting it again would
+    // reprogram the encoder and replace the frame buffer for nothing.
+    VIDEO_MODE cur = XVideoGetMode();
+    if (cur.width == window->w && cur.height == window->h && cur.bpp == bpp) {
+        // already in this mode
+    } else if (!XVideoSetMode(window->w, window->h, bpp, REFRESH_DEFAULT)) {
         window->w = 640;
         window->h = 480;
         if (!XVideoSetMode(window->w, window->h, bpp, REFRESH_DEFAULT)) {

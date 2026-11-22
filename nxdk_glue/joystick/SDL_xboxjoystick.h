@@ -12,4 +12,6 @@
 // modify the SDL3 source code.
 #define SDL_XBOX_JoystickDriver SDL_DUMMY_JoystickDriver
 
+void SDL_XBOX_SetHubPollMs(Uint32 ms);
+
 #endif /* SDL_xboxjoystick_h_ */

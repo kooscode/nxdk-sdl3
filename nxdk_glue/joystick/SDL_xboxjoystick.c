@@ -81,6 +81,15 @@ static controller_connection_event_t uid_event_queue[8];
 static uint32_t uid_event_write_index = 0;
 static uint32_t uid_event_read_index = 0;
 static Uint64 last_hub_poll_ms = 0;
+static Uint32 hub_poll_ms = HUB_POLL_INTERVAL_MS;
+
+// How often to walk the USB hubs for plug/unplug, in ms; 0 stops walking them
+// (reports from connected pads still arrive). Long-running apps turn this down
+// while a pad is idle: each walk costs CPU and allocations.
+void SDL_XBOX_SetHubPollMs(Uint32 ms)
+{
+    hub_poll_ms = ms;
+}
 
 static void push_connection_event(uint32_t uid, bool connected)
 {
@@ -285,7 +294,7 @@ static int SDL_XBOX_JoystickGetCount(void)
 static void SDL_XBOX_JoystickDetect(void)
 {
     Uint64 now = SDL_GetTicks();
-    if ((now - last_hub_poll_ms) >= HUB_POLL_INTERVAL_MS) {
+    if (hub_poll_ms && (now - last_hub_poll_ms) >= hub_poll_ms) {
         usbh_pooling_hubs();
         last_hub_poll_ms = now;
     }

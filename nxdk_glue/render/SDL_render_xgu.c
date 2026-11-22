@@ -51,6 +51,9 @@
 #ifndef NV097_INVALIDATE_VERTEX_CACHE_FILE
 #define NV097_INVALIDATE_VERTEX_CACHE_FILE 0x00001710
 #endif
+#ifndef NV097_INVALIDATE_VERTEX_FILE
+#define NV097_INVALIDATE_VERTEX_FILE 0x00001714
+#endif
 
 typedef struct xgu_texture
 {
@@ -553,9 +556,18 @@ static inline int bind_vertex_stream(xgu_render_data_t *render_data, xgu_vertex_
             p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + XGU_TEXCOORD0_ARRAY * 4,
                          base_phys + offsetof(xgu_vertex_textured_t, tex));
         }
-        p = pb_push1(p, NV097_INVALIDATE_VERTEX_CACHE_FILE, 0);
         render_data->active_vertex_base = base_phys;
     }
+
+    // Drop both NV2A vertex caches before every draw. The arena hands out the
+    // same offsets, and so the same vertex indices, every frame, and the
+    // base address rarely changes; invalidating only on a base change left
+    // stale entries the hardware reused for new geometry after render-target
+    // switches, vertex-layout changes and similar sequences: one corner of a
+    // quad flung across the screen for a frame. Seen on hardware (not in
+    // xemu); costs two methods per draw.
+    p = pb_push1(p, NV097_INVALIDATE_VERTEX_CACHE_FILE, 0);
+    p = pb_push1(p, NV097_INVALIDATE_VERTEX_FILE, 0);
 
     return (int)start_index;
 }
@@ -1211,7 +1223,9 @@ static SDL_Surface *XBOX_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect
 }
 
 // The most vertical blanks RenderPresent waits for a buffer flip (see there).
+#ifndef SDL_XGU_MAX_FLIP_WAIT
 #define SDL_XGU_MAX_FLIP_WAIT 3
+#endif
 
 static bool XBOX_RenderPresent(SDL_Renderer *renderer)
 {
