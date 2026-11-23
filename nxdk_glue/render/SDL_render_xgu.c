@@ -36,10 +36,10 @@
 #endif
 #endif
 
-// NV2A places pixel sample centers at integer coordinates (0.0, 0.0), whereas
-// SDL3 places pixel (0, 0)'s center at (0.5, 0.5). We apply a -0.5f hardware
-// viewport offset so SDL geometry aligns with NV2A pixel/texel centers, and bias
-// integer point/line coordinates by +0.5f to land on pixel centers.
+// Point and line primitives are biased onto pixel centers. Quads are not:
+// a -0.5 viewport offset was tried on hardware and it both softened every
+// blit (samples landed on the texel boundary) and uncovered a green line on
+// the right and bottom of the frame. Leave the viewport at the SDL origin.
 #define SDL_XGU_PIXEL_BIAS (0.5f)
 
 // CRTC scanout start address register (see nxdk lib/pbkit/outer.h)
@@ -606,6 +606,32 @@ static void XBOX_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *even
     (void)event;
 }
 
+/* Next power of two, at least 4. 0 means it will not fit a swizzled texture. */
+static int xgu_pot_dim(int v)
+{
+    int p = 4;
+    if (v < 1)
+        v = 1;
+    while (p < v) {
+        if (p >= 1024)
+            return 0;
+        p <<= 1;
+    }
+    return p;
+}
+
+static void xgu_texture_size_linear(xgu_texture_t *xgu_texture, int w, int h, bool is_render_target)
+{
+    const int min_dim = 8 / xgu_texture->bytes_per_pixel;
+    const int align = (is_render_target ? 64 : 8) / xgu_texture->bytes_per_pixel;
+    xgu_texture->swizzled = 0;
+    xgu_texture->data_width = (w + align - 1) & ~(align - 1);
+    xgu_texture->data_height = SDL_max(h, min_dim);
+    xgu_texture->u_scale = (float)w;
+    xgu_texture->v_scale = (float)h;
+    xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
+}
+
 static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL_PropertiesID create_props)
 {
     (void)renderer;
@@ -623,11 +649,23 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         return SDL_SetError("[nxdk renderer] Unsupported render target format (%s)", SDL_GetPixelFormatName(texture->format));
     }
 
-    // Swizzle static POT textures (at least 4x4) for faster sampling and hardware wrapping support
-    const bool is_pot = (texture->w >= 4) && ((texture->w & (texture->w - 1)) == 0) &&
-                        (texture->h >= 4) && ((texture->h & (texture->h - 1)) == 0);
-    if (access == SDL_TEXTUREACCESS_STATIC && is_pot) {
-        xgu_texture->swizzled = 1;
+    /* Linear (LU_IMAGE) textures smear under the NV2A sampler even when the
+     * filter register says point. Static textures are padded to a power of
+     * two and swizzled so nearest sampling is a real point sample. Streaming
+     * and render targets stay linear: they are locked or drawn into as a
+     * pitch surface. Padding is capped so a cover cannot eat a megabyte. */
+    xgu_texture->tex_width = texture->w;
+    xgu_texture->tex_height = texture->h;
+    if (access == SDL_TEXTUREACCESS_STATIC) {
+        const int pot_w = xgu_pot_dim(texture->w);
+        const int pot_h = xgu_pot_dim(texture->h);
+        int bpp = SDL_BYTESPERPIXEL(texture->format);
+        if (pot_w > 0 && pot_h > 0 && bpp > 0 &&
+            (SIZE_T)pot_w * (SIZE_T)pot_h * (SIZE_T)bpp <= (SIZE_T)256 * 1024) {
+            xgu_texture->swizzled = 1;
+            xgu_texture->data_width = pot_w;
+            xgu_texture->data_height = pot_h;
+        }
     }
 
     if (!sdl_to_xgu_texture_format(texture->format, &xgu_texture->format, &xgu_texture->bytes_per_pixel, xgu_texture->swizzled)) {
@@ -635,28 +673,33 @@ static bool XBOX_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         return SDL_SetError("[nxdk renderer] Unsupported texture format (%s)", SDL_GetPixelFormatName(texture->format));
     }
 
-    xgu_texture->tex_width = texture->w;
-    xgu_texture->tex_height = texture->h;
-
     if (xgu_texture->swizzled) {
-        xgu_texture->data_width = texture->w;
-        xgu_texture->data_height = texture->h;
-        xgu_texture->u_scale = 1.0f;
-        xgu_texture->v_scale = 1.0f;
+        /* UV 0..1 covers the content texels. A 1:1 quad then puts each
+         * pixel center on a texel center. Shorting the range by half a
+         * texel clips the last column (chopped stems) and repeats another. */
+        if (xgu_texture->data_width == texture->w && xgu_texture->data_height == texture->h) {
+            xgu_texture->u_scale = 1.0f;
+            xgu_texture->v_scale = 1.0f;
+        } else {
+            xgu_texture->u_scale = (float)texture->w / (float)xgu_texture->data_width;
+            xgu_texture->v_scale = (float)texture->h / (float)xgu_texture->data_height;
+        }
+        xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
     } else {
-        // NV2A pitch alignment is 64 bytes for render targets and 8 bytes for linear textures
-        const int min_dim = 8 / xgu_texture->bytes_per_pixel;
-        const int align = (is_render_target ? 64 : 8) / xgu_texture->bytes_per_pixel;
-        xgu_texture->data_width = (texture->w + align - 1) & ~(align - 1);
-        xgu_texture->data_height = SDL_max(texture->h, min_dim);
-        xgu_texture->u_scale = (float)texture->w;
-        xgu_texture->v_scale = (float)texture->h;
+        xgu_texture_size_linear(xgu_texture, texture->w, texture->h, is_render_target);
     }
 
-    xgu_texture->pitch = xgu_texture->data_width * xgu_texture->bytes_per_pixel;
-
-    const SIZE_T allocation_size = (SIZE_T)xgu_texture->data_height * xgu_texture->pitch;
+    SIZE_T allocation_size = (SIZE_T)xgu_texture->data_height * xgu_texture->pitch;
     xgu_texture->data = MmAllocateContiguousMemoryEx(allocation_size, 0, SDL_MAX_UINT32, 0, PAGE_WRITECOMBINE | PAGE_READWRITE);
+    if (xgu_texture->data == NULL && xgu_texture->swizzled) {
+        if (!sdl_to_xgu_texture_format(texture->format, &xgu_texture->format, &xgu_texture->bytes_per_pixel, false)) {
+            SDL_free(xgu_texture);
+            return SDL_SetError("[nxdk renderer] Unsupported texture format (%s)", SDL_GetPixelFormatName(texture->format));
+        }
+        xgu_texture_size_linear(xgu_texture, texture->w, texture->h, is_render_target);
+        allocation_size = (SIZE_T)xgu_texture->data_height * xgu_texture->pitch;
+        xgu_texture->data = MmAllocateContiguousMemoryEx(allocation_size, 0, SDL_MAX_UINT32, 0, PAGE_WRITECOMBINE | PAGE_READWRITE);
+    }
     if (xgu_texture->data == NULL) {
         SDL_free(xgu_texture);
         return SDL_OutOfMemory();
@@ -715,12 +758,17 @@ static bool XBOX_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
     wait_texture_idle(render_data, xgu_texture);
 
     if (xgu_texture->swizzled) {
+        /* data_width/height are the POT allocation. A full upload of that
+         * allocation uses the bulk swizzler; a content rect inside padding
+         * (or any partial update) uses the subrect walker. */
         if (rect->x == 0 && rect->y == 0 &&
-            rect->w == xgu_texture->tex_width && rect->h == xgu_texture->tex_height) {
-            swizzle_rect(src, xgu_texture->tex_width, xgu_texture->tex_height, xgu_texture->data, pitch, xgu_texture->bytes_per_pixel);
+            rect->w == xgu_texture->data_width &&
+            rect->h == xgu_texture->data_height) {
+            swizzle_rect(src, xgu_texture->data_width, xgu_texture->data_height,
+                         xgu_texture->data, pitch, xgu_texture->bytes_per_pixel);
         } else {
             swizzle_subrect(src, pitch, xgu_texture->data,
-                            xgu_texture->tex_width, xgu_texture->tex_height,
+                            xgu_texture->data_width, xgu_texture->data_height,
                             xgu_texture->bytes_per_pixel, rect);
         }
     } else {
@@ -868,13 +916,60 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
     if (texture) {
         xgu_vertex_textured_t *out = (xgu_vertex_textured_t *)vertices;
         const xgu_texture_t *xgu_tex = (const xgu_texture_t *)texture->internal;
-        const float u_scale = xgu_tex->u_scale;
-        const float v_scale = xgu_tex->v_scale;
+        float u_mul = xgu_tex->u_scale;
+        float v_mul = xgu_tex->v_scale;
+        float u_add = 0.0f;
+        float v_add = 0.0f;
+        /* Quad batches are stored as groups of 4. A 1:1 quad already puts
+         * each pixel center on a texel center; shifting that clips the last
+         * column of a glyph. A scaled quad is the old D3D copy: sample from
+         * the center of the first source texel to the center of the last.
+         * UV 0..1 across the whole texel hits the edge and the scale looks soft. */
+        const int quad_uv = xgu_tex->swizzled && size_indices == 0 &&
+                            texture->w > 1 && texture->h > 1 &&
+                            xgu_tex->data_width > 0 && xgu_tex->data_height > 0 &&
+                            xy && uv && xy_stride >= 8 && uv_stride >= 8 &&
+                            count >= 4 && (count % 4) == 0;
 
         for (int i = 0; i < count; i++) {
             const int j = size_indices ? get_vertex_index(indices, size_indices, i) : i;
             const float *vp = (const float *)((const char *)xy + j * xy_stride);
             const float *vt = (const float *)((const char *)uv + j * uv_stride);
+
+            if (quad_uv && (i % 4) == 0) {
+                const float *p2 = (const float *)((const char *)xy + (j + 2) * xy_stride);
+                const float *t2 = (const float *)((const char *)uv + (j + 2) * uv_stride);
+                float pw = (p2[0] - vp[0]) * scale_x;
+                float ph = (p2[1] - vp[1]) * scale_y;
+                float su = t2[0] - vt[0];
+                float sv = t2[1] - vt[1];
+                float srcw = su * (float)texture->w;
+                float srch = sv * (float)texture->h;
+                float dw, dh;
+                u_mul = xgu_tex->u_scale;
+                v_mul = xgu_tex->v_scale;
+                u_add = 0.0f;
+                v_add = 0.0f;
+                if (pw < 0.0f) pw = -pw;
+                if (ph < 0.0f) ph = -ph;
+                if (srcw < 0.0f) srcw = -srcw;
+                if (srch < 0.0f) srch = -srch;
+                dw = pw - srcw;
+                dh = ph - srch;
+                if (dw < 0.0f) dw = -dw;
+                if (dh < 0.0f) dh = -dh;
+                if (su > 0.0001f && sv > 0.0001f && srcw > 1.0f && srch > 1.0f &&
+                    (dw > 1.5f || dh > 1.5f)) {
+                    float potw = (float)xgu_tex->data_width;
+                    float poth = (float)xgu_tex->data_height;
+                    float tw = (float)texture->w;
+                    float th = (float)texture->h;
+                    u_mul = (su * tw - 1.0f) / (su * potw);
+                    v_mul = (sv * th - 1.0f) / (sv * poth);
+                    u_add = (vt[0] * tw + 0.5f) / potw - vt[0] * u_mul;
+                    v_add = (vt[1] * th + 0.5f) / poth - vt[1] * v_mul;
+                }
+            }
 
             if (color_stride != 0) {
                 const SDL_FColor *fc = (const SDL_FColor *)((const char *)color + j * color_stride);
@@ -887,8 +982,8 @@ static bool XBOX_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
             out[i].pos[0] = vp[0] * scale_x;
             out[i].pos[1] = vp[1] * scale_y;
             out[i].color32 = cached_color32;
-            out[i].tex[0] = vt[0] * u_scale;
-            out[i].tex[1] = vt[1] * v_scale;
+            out[i].tex[0] = u_add + vt[0] * u_mul;
+            out[i].tex[1] = v_add + vt[1] * v_mul;
         }
     } else {
         xgu_vertex_t *out = (xgu_vertex_t *)vertices;
@@ -934,7 +1029,10 @@ static bool XBOX_RenderSetViewPort(SDL_Renderer *renderer, SDL_RenderCommand *cm
     render_data->viewport = *viewport;
     render_data->viewport_dirty = false;
 
-    p = xgu_set_viewport_offset(p, (float)viewport->x, (float)viewport->y, 0.0f, 0.0f);
+    p = xgu_set_viewport_offset(p,
+                                (float)viewport->x,
+                                (float)viewport->y,
+                                0.0f, 0.0f);
     p = push_current_scissor(renderer, p);
 
     return true;
@@ -1012,8 +1110,15 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
 
         set_texture_shader(render_data, 1);
 
+        /* Point sampling a minified photo or logo drops pixels and looks
+         * low quality. Bilinear is a real sample only on a swizzled
+         * texture; a linear pitch texture smears under either filter, so
+         * those stay nearest. Text and icons never request linear. */
         const XguTexFilter texture_filter =
-            (cmd->data.draw.texture_scale_mode == SDL_SCALEMODE_LINEAR) ? XGU_TEXTURE_FILTER_LINEAR : XGU_TEXTURE_FILTER_NEAREST;
+            (xgu_texture->swizzled &&
+             cmd->data.draw.texture_scale_mode == SDL_SCALEMODE_LINEAR)
+                ? XGU_TEXTURE_FILTER_LINEAR
+                : XGU_TEXTURE_FILTER_NEAREST;
 
         // NV2A only supports hardware wrapping on swizzled POT textures
         const XguTextureAddress mode_u =
@@ -1041,6 +1146,10 @@ static bool XBOX_RenderGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
         }
 
         if (xgu_texture->filter != texture_filter) {
+            /* Kernel must be quincunx (1) or gaussian (2). Zero is rejected
+             * as invalid data on SET_TEXTURE_FILTER (method 0x1B14) and
+             * halts the GPU at boot. The kernel is unused unless the min
+             * filter is convolution. */
             p = xgu_set_texture_filter(p, 0, 0, XGU_TEXTURE_CONVOLUTION_GAUSSIAN,
                                        texture_filter, texture_filter, false, false, false, false);
             xgu_texture->filter = texture_filter;
