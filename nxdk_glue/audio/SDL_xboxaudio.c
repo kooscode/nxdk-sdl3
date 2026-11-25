@@ -70,9 +70,13 @@ static bool XBOXAUDIO_WaitDevice(SDL_AudioDevice *device)
         if (queued > SDL_XBOXAUDIO_BUFFER_COUNT - 1) {
             // More in flight than we ever queue: on an underrun the MCPX does
             // not halt at LVI, it laps stale descriptors (heard as a stuck
-            // loop, or silence). Reset the engine and start over.
+            // loop, or silence). Reset the engine and start over, with
+            // XAudioResync in nxdk builds that define XAUDIO_HAVE_RESYNC.
+#ifdef XAUDIO_HAVE_RESYNC
             XAudioResync();
             audio_data->restart = true;
+#endif
+            // Without XAudioResync (stock nxdk), keep refilling: LVI catches up.
             break;
         }
         if (queued <= SDL_XBOXAUDIO_REFILL_DEPTH) {
@@ -129,9 +133,14 @@ static void XBOXAUDIO_CloseDevice(SDL_AudioDevice *device)
     SDL_PrivateAudioData *audio_data = (SDL_PrivateAudioData *)device->hidden;
     // Stop the engines, clear their descriptor bases and disconnect the IRQ, so
     // nothing is left running into the next title (HalQuickReboot does not
-    // reset the MCPX).
+    // reset the MCPX). XAudioShutdown is in nxdk builds that define
+    // XAUDIO_HAVE_SHUTDOWN; otherwise re-init without a callback, as before.
     XAudioPause();
+#ifdef XAUDIO_HAVE_SHUTDOWN
     XAudioShutdown();
+#else
+    XAudioInit(16, 2, NULL, NULL);
+#endif
 
     for (int i = 0; i < SDL_XBOXAUDIO_BUFFER_COUNT; i++) {
         if (audio_data->buffers[i]) {
